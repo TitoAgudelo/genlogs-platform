@@ -1,18 +1,17 @@
 """
 Rule-based service that converts natural language queries to SQL
-and executes them against the trips dataset.
+and executes them against the normalized database schema.
 """
 
-import re
 from dataclasses import dataclass
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from db.database import SessionLocal
-from db.models import Trip as TripModel
+from db.models import Carrier, Trip as TripModel
 from db.seed import FALLBACK_CARRIERS
-from data.trips import Trip
+from services.city_normalizer import extract_cities_from_text, normalize_city
 
 
 @dataclass(frozen=True)
@@ -22,48 +21,13 @@ class AIQueryResult:
     explanation: str
 
 
-# Known city names for extraction
-KNOWN_CITIES = {
-    "new york", "washington dc", "san francisco", "los angeles",
-    "chicago", "detroit", "dallas", "houston", "miami", "atlanta",
-    "seattle", "portland", "boston", "philadelphia", "denver", "salt lake city",
-}
-
-
-def _normalize(text: str) -> str:
-    return text.strip().lower()
-
-
-def _extract_cities(query: str) -> tuple[str | None, str | None]:
-    """Extract origin and destination cities from a natural language query, preserving order of appearance."""
-    query_lower = _normalize(query)
-
-    # Find all cities with their position in the query
-    found: list[tuple[int, str]] = []
-    for city in sorted(KNOWN_CITIES, key=len, reverse=True):
-        pos = query_lower.find(city)
-        if pos != -1:
-            found.append((pos, city))
-            # Replace to avoid substring re-matching
-            query_lower = query_lower[:pos] + ("_" * len(city)) + query_lower[pos + len(city):]
-
-    # Sort by position to respect query order
-    found.sort(key=lambda x: x[0])
-
-    if len(found) >= 2:
-        return found[0][1], found[1][1]
-    if len(found) == 1:
-        return found[0][1], None
-    return None, None
-
-
 def _extract_carrier(query: str) -> str | None:
     """Extract carrier name from query."""
-    query_lower = _normalize(query)
+    query_lower = query.strip().lower()
     known_carriers = [
-        "ups", "fedex", "xpo logistics", "schneider",
         "knight-swift", "j.b. hunt", "yrc worldwide",
-        "landstar", "ups inc", "fedex corp",
+        "xpo logistics", "schneider", "landstar",
+        "ups inc", "ups", "fedex corp", "fedex",
     ]
     for carrier in known_carriers:
         if carrier in query_lower:
@@ -71,11 +35,16 @@ def _extract_carrier(query: str) -> str | None:
     return None
 
 
-def _title_case_city(city: str) -> str:
-    """Convert city name to proper title case."""
-    special = {"dc": "DC"}
-    words = city.split()
-    return " ".join(special.get(w, w.capitalize()) for w in words)
+def _classify_query(query: str) -> str:
+    query_lower = query.strip().lower()
+
+    if any(w in query_lower for w in ["how many", "count", "total", "number"]):
+        return "count"
+    if any(w in query_lower for w in ["top", "most", "busiest", "highest"]):
+        return "top"
+    if any(w in query_lower for w in ["route", "routes", "lane", "lanes"]):
+        return "routes"
+    return "carriers"
 
 
 def _execute_on_dataset(
@@ -83,55 +52,57 @@ def _execute_on_dataset(
     destination: str | None = None,
     carrier: str | None = None,
     db: Session | None = None,
-) -> list[Trip]:
-    """Filter trips dataset based on criteria using the database.
-
-    Returns fallback carriers when an origin+destination pair has no DB matches.
-    """
+) -> list[dict[str, str | int]]:
+    """Query the normalized schema: JOIN trips with carriers, GROUP BY carrier."""
     close_db = False
     if db is None:
         db = SessionLocal()
         close_db = True
 
     try:
-        query = db.query(TripModel)
+        query = (
+            db.query(
+                Carrier.name.label("carrier_name"),
+                func.count(TripModel.trip_id).label("trucks_per_day"),
+                TripModel.origin_city,
+                TripModel.destination_city,
+            )
+            .join(Carrier, TripModel.carrier_id == Carrier.carrier_id)
+        )
 
         if origin:
-            query = query.filter(func.lower(TripModel.origin_city) == _normalize(origin))
+            query = query.filter(func.lower(TripModel.origin_city) == origin.lower())
         if destination:
-            query = query.filter(func.lower(TripModel.destination_city) == _normalize(destination))
+            query = query.filter(func.lower(TripModel.destination_city) == destination.lower())
         if carrier:
-            query = query.filter(func.lower(TripModel.carrier_name) == _normalize(carrier))
+            query = query.filter(func.lower(Carrier.name).contains(carrier.lower()))
+
+        query = query.group_by(Carrier.name, TripModel.origin_city, TripModel.destination_city)
+        query = query.order_by(func.count(TripModel.trip_id).desc())
 
         rows = query.all()
 
         if rows:
             return [
-                Trip(
-                    trip_id=r.trip_id,
-                    truck_id=r.truck_id,
-                    carrier_name=r.carrier_name,
-                    origin_city=r.origin_city,
-                    destination_city=r.destination_city,
-                    trucks_per_day=r.trucks_per_day,
-                    trip_date=r.trip_date,
-                )
+                {
+                    "carrier_name": r.carrier_name,
+                    "trucks_per_day": r.trucks_per_day,
+                    "origin": r.origin_city,
+                    "destination": r.destination_city,
+                }
                 for r in rows
             ]
 
-        # Fallback for unknown routes (only when both origin and destination given)
+        # Fallback for unknown routes
         if origin and destination and not carrier:
             return [
-                Trip(
-                    trip_id=f"fallback-{i}",
-                    truck_id=f"TRK-FB-{i}",
-                    carrier_name=fc["carrier_name"],
-                    origin_city=_title_case_city(origin),
-                    destination_city=_title_case_city(destination),
-                    trucks_per_day=fc["trucks_per_day"],
-                    trip_date="2026-03-15",
-                )
-                for i, fc in enumerate(FALLBACK_CARRIERS)
+                {
+                    "carrier_name": fc["carrier_name"],
+                    "trucks_per_day": fc["trucks_per_day"],
+                    "origin": origin,
+                    "destination": destination,
+                }
+                for fc in FALLBACK_CARRIERS
             ]
 
         return []
@@ -140,81 +111,69 @@ def _execute_on_dataset(
             db.close()
 
 
-def _classify_query(query: str) -> str:
-    """Classify the type of query."""
-    query_lower = _normalize(query)
+def _build_sql(
+    query_type: str,
+    origin: str | None,
+    destination: str | None,
+    carrier: str | None,
+) -> str:
+    """Build a display SQL string reflecting the normalized schema."""
+    if query_type == "count":
+        select_clause = (
+            "SELECT c.name AS carrier_name, COUNT(t.trip_id) AS trucks_per_day"
+        )
+    elif query_type == "routes":
+        select_clause = (
+            "SELECT DISTINCT t.origin_city, t.destination_city, "
+            "c.name AS carrier_name, COUNT(t.trip_id) AS trucks_per_day"
+        )
+    else:
+        select_clause = (
+            "SELECT c.name AS carrier_name, COUNT(t.trip_id) AS trucks_per_day"
+        )
 
-    if any(w in query_lower for w in ["how many", "count", "total", "number"]):
-        return "count"
-    if any(w in query_lower for w in ["top", "most", "busiest", "highest"]):
-        return "top"
-    if any(w in query_lower for w in ["route", "routes", "lane", "lanes"]):
-        return "routes"
-    if any(w in query_lower for w in ["carrier", "carriers", "operate", "which"]):
-        return "carriers"
-    return "carriers"
+    from_clause = "FROM trips t\nJOIN carriers c ON t.carrier_id = c.carrier_id"
+
+    where_parts: list[str] = []
+    if origin:
+        where_parts.append(f"t.origin_city = '{origin}'")
+    if destination:
+        where_parts.append(f"t.destination_city = '{destination}'")
+    if carrier:
+        where_parts.append(f"c.name LIKE '%{carrier}%'")
+
+    where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    group_clause = "GROUP BY c.name"
+    order_clause = "ORDER BY trucks_per_day DESC"
+
+    if query_type == "top":
+        order_clause += "\nLIMIT 5"
+
+    parts = [select_clause, from_clause, where_clause, group_clause, order_clause]
+    return "\n".join(p for p in parts if p).strip()
 
 
 def process_ai_query(query: str) -> AIQueryResult:
     """Process a natural language query and return SQL + results."""
-    origin, destination = _extract_cities(query)
+    origin, destination = extract_cities_from_text(query)
     carrier = _extract_carrier(query)
     query_type = _classify_query(query)
 
-    # Build SQL
-    select_clause = "SELECT carrier_name, trucks_per_day"
-    from_clause = "FROM trips"
-    where_parts: list[str] = []
-    order_clause = "ORDER BY trucks_per_day DESC"
+    sql = _build_sql(query_type, origin, destination, carrier)
 
-    if origin:
-        where_parts.append(f"origin_city = '{_title_case_city(origin)}'")
-    if destination:
-        where_parts.append(f"destination_city = '{_title_case_city(destination)}'")
-    if carrier:
-        where_parts.append(f"carrier_name = '{_title_case_city(carrier)}'")
-
-    if query_type == "count":
-        select_clause = "SELECT COUNT(*) as total_carriers, SUM(trucks_per_day) as total_trucks"
-    elif query_type == "routes":
-        select_clause = "SELECT DISTINCT origin_city, destination_city, carrier_name, trucks_per_day"
-    elif query_type == "top":
-        order_clause = "ORDER BY trucks_per_day DESC\nLIMIT 5"
-
-    where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
-    sql = f"{select_clause}\n{from_clause}\n{where_clause}\n{order_clause}".strip()
-
-    # Execute
-    trips = _execute_on_dataset(origin, destination, carrier)
-    trips_sorted = sorted(trips, key=lambda t: t.trucks_per_day, reverse=True)
+    raw_results = _execute_on_dataset(origin, destination, carrier)
+    sorted_results = sorted(raw_results, key=lambda r: r["trucks_per_day"], reverse=True)
 
     if query_type == "count":
         results: list[dict[str, str | int]] = [{
-            "total_carriers": len(trips_sorted),
-            "total_trucks_per_day": sum(t.trucks_per_day for t in trips_sorted),
+            "total_carriers": len(sorted_results),
+            "total_trucks_per_day": sum(r["trucks_per_day"] for r in sorted_results),
         }]
     elif query_type == "top":
-        results = [
-            {
-                "carrier_name": t.carrier_name,
-                "trucks_per_day": t.trucks_per_day,
-                "origin": t.origin_city,
-                "destination": t.destination_city,
-            }
-            for t in trips_sorted[:5]
-        ]
+        results = sorted_results[:5]
     else:
-        results = [
-            {
-                "carrier_name": t.carrier_name,
-                "trucks_per_day": t.trucks_per_day,
-                "origin": t.origin_city,
-                "destination": t.destination_city,
-            }
-            for t in trips_sorted
-        ]
+        results = sorted_results
 
-    # Generate explanation
     explanation = _generate_explanation(query_type, origin, destination, carrier, results)
 
     return AIQueryResult(sql=sql, results=results, explanation=explanation)
@@ -232,11 +191,11 @@ def _generate_explanation(
 
     route_desc = ""
     if origin and destination:
-        route_desc = f"between {_title_case_city(origin)} and {_title_case_city(destination)}"
+        route_desc = f"between {origin} and {destination}"
     elif origin:
-        route_desc = f"from {_title_case_city(origin)}"
+        route_desc = f"from {origin}"
     elif destination:
-        route_desc = f"to {_title_case_city(destination)}"
+        route_desc = f"to {destination}"
 
     if query_type == "count":
         total = results[0]
@@ -251,6 +210,6 @@ def _generate_explanation(
     )
 
     if carrier:
-        return f"{_title_case_city(carrier)} operates {route_desc} with the following activity: {carrier_list}"
+        return f"{carrier} operates {route_desc} with the following activity: {carrier_list}"
 
     return f"The top carriers {route_desc} are: {carrier_list}"

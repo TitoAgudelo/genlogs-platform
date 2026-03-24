@@ -17,7 +17,7 @@ export default function GoogleMapsProvider({ children }: GoogleMapsProviderProps
   }
 
   return (
-    <LoadScript googleMapsApiKey={GOOGLE_MAPS_API_KEY} libraries={LIBRARIES}>
+    <LoadScript googleMapsApiKey={GOOGLE_MAPS_API_KEY} libraries={LIBRARIES} language="en">
       {children}
     </LoadScript>
   );

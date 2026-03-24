@@ -40,12 +40,29 @@ export default function PlacesAutocomplete({
     const autocomplete = new google.maps.places.Autocomplete(inputRef.current, {
       types: ["(cities)"],
       componentRestrictions: { country: "us" },
+      fields: ["address_components", "name", "formatted_address"],
     });
 
     autocomplete.addListener("place_changed", () => {
       const place = autocomplete.getPlace();
-      if (place?.formatted_address) {
-        // Extract just the city name (before first comma)
+
+      // Extract the English city name from address_components
+      // This avoids localized names like "Nueva York" or "Washington D. C."
+      const localityComponent = place?.address_components?.find((c) =>
+        c.types.includes("locality")
+      );
+      const subLocalityComponent = place?.address_components?.find((c) =>
+        c.types.includes("sublocality")
+      );
+      const adminComponent = place?.address_components?.find((c) =>
+        c.types.includes("administrative_area_level_1")
+      );
+
+      if (localityComponent) {
+        onChange(localityComponent.long_name);
+      } else if (subLocalityComponent) {
+        onChange(subLocalityComponent.long_name);
+      } else if (place?.formatted_address) {
         const city = place.formatted_address.split(",")[0]?.trim() || "";
         onChange(city);
       } else if (place?.name) {

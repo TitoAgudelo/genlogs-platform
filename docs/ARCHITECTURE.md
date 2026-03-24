@@ -115,54 +115,187 @@ def get_db():
 
 This is a **FastAPI dependency** using Python's generator pattern. FastAPI calls `next()` to get the session, injects it into route handlers, and after the response is sent, the `finally` block closes the session. This ensures connections are never leaked.
 
-### 3.2 The Trip Model (`apps/api/db/models.py`)
+### 3.2 Normalized Database Schema (`apps/api/db/models.py`)
+
+The database uses a **normalized relational model** with 7 entities that model the real-world pipeline: cameras capture images, images are processed to detect trucks, sightings track truck locations, and trips represent computed movements between cities.
+
+**Entity Relationship Diagram:**
+
+```
+cameras ──1:N──> image_transactions ──1:N──> image_processing_results
+                       │
+                       └──1:N──> truck_sightings <──N:1── trucks ──N:1──> carriers
+                                                            │                │
+                                                            └──1:N──> trips <┘
+```
+
+#### 3.2.1 cameras
+
+Physical camera devices installed on US highways.
+
+```python
+class Camera(Base):
+    __tablename__ = "cameras"
+
+    camera_id    = Column(String, primary_key=True)    # e.g., "cam-001"
+    latitude     = Column(Float, nullable=False)        # e.g., 40.7580
+    longitude    = Column(Float, nullable=False)        # e.g., -73.9855
+    highway_name = Column(String, nullable=False)       # e.g., "I-95 New York"
+```
+
+**Purpose:** Represents the physical infrastructure. Each camera has a fixed GPS location on a specific highway. This is the entry point of the data pipeline.
+
+#### 3.2.2 image_transactions
+
+Each image captured by a camera. One camera produces many images over time.
+
+```python
+class ImageTransaction(Base):
+    __tablename__ = "image_transactions"
+
+    image_id           = Column(String, primary_key=True)
+    camera_id          = Column(String, ForeignKey("cameras.camera_id"), nullable=False)
+    timestamp          = Column(String, nullable=False)     # ISO 8601 format
+    storage_path       = Column(String, nullable=False)     # e.g., "s3://genlogs-images/img-0001.jpg"
+    weather_conditions = Column(String, nullable=True)      # e.g., "clear", "rainy"
+    vehicle_speed      = Column(Float, nullable=True)       # estimated mph
+```
+
+**Key design decisions:**
+- `storage_path` enables **reprocessing** - if the AI model improves, old images can be re-analyzed
+- `weather_conditions` and `vehicle_speed` are nullable because they may not always be available
+- The FK to `cameras` lets you query "all images from camera X"
+
+#### 3.2.3 image_processing_results
+
+Stores AI analysis results. One image can produce multiple results (plate detection, logo detection, truck number).
+
+```python
+class ImageProcessingResult(Base):
+    __tablename__ = "image_processing_results"
+
+    result_id        = Column(String, primary_key=True)
+    image_id         = Column(String, ForeignKey("image_transactions.image_id"), nullable=False)
+    analysis_type    = Column(String, nullable=False)    # "plate", "logo", or "truck_number"
+    detected_value   = Column(String, nullable=False)    # e.g., "NY-KS-1001" or "Knight-Swift"
+    confidence_score = Column(Float, nullable=False)     # 0.0 to 1.0
+```
+
+**Why one-to-many?** A single image might contain a visible license plate AND a company logo. Each detection is a separate row, which allows:
+- Independent confidence scores per detection type
+- Querying all plate detections vs all logo detections separately
+- Adding new analysis types without schema changes
+
+#### 3.2.4 carriers
+
+Transport companies registered with USDOT.
+
+```python
+class Carrier(Base):
+    __tablename__ = "carriers"
+
+    carrier_id       = Column(String, primary_key=True)
+    name             = Column(String, nullable=False)     # e.g., "Knight-Swift Transport Services"
+    usdot_number     = Column(String, nullable=False)     # e.g., "USDOT-2247642"
+    headquarters_city = Column(String, nullable=False)    # e.g., "Phoenix"
+```
+
+**Why a separate carriers table?** The old schema stored `carrier_name` directly in trips. The normalized design:
+- Eliminates data duplication (carrier name stored once, not in every trip)
+- Adds structured carrier metadata (USDOT number, HQ city)
+- Enables carrier-centric queries ("show me all trucks owned by UPS")
+
+#### 3.2.5 trucks
+
+Individual trucks, each belonging to one carrier.
+
+```python
+class Truck(Base):
+    __tablename__ = "trucks"
+
+    truck_id      = Column(String, primary_key=True)
+    license_plate = Column(String, nullable=False)    # e.g., "NY-KS-1001"
+    usdot_number  = Column(String, nullable=False)    # truck-level USDOT
+    carrier_id    = Column(String, ForeignKey("carriers.carrier_id"), nullable=False)
+```
+
+**Relationship:** One carrier owns many trucks. The FK enforces referential integrity - you can't create a truck without a valid carrier.
+
+#### 3.2.6 truck_sightings
+
+When a truck is detected at a camera location. This is the bridge between raw images and truck tracking.
+
+```python
+class TruckSighting(Base):
+    __tablename__ = "truck_sightings"
+
+    sighting_id      = Column(String, primary_key=True)
+    truck_id         = Column(String, ForeignKey("trucks.truck_id"), nullable=False)
+    image_id         = Column(String, ForeignKey("image_transactions.image_id"), nullable=False)
+    timestamp        = Column(String, nullable=False)
+    latitude         = Column(Float, nullable=False)
+    longitude        = Column(Float, nullable=False)
+    confidence_score = Column(Float, nullable=False)
+```
+
+**Key relationships:**
+- One image can detect **multiple trucks** (trucks traveling together)
+- One truck appears in **many sightings** over time (as it passes different cameras)
+- The `latitude`/`longitude` come from the camera but are denormalized here for query performance
+
+#### 3.2.7 trips
+
+Precomputed movement records between cities. **Trips are derived from sightings**, not calculated on-the-fly.
 
 ```python
 class Trip(Base):
     __tablename__ = "trips"
 
     trip_id          = Column(String, primary_key=True)
-    truck_id         = Column(String, nullable=False)
-    carrier_name     = Column(String, nullable=False)
+    truck_id         = Column(String, ForeignKey("trucks.truck_id"), nullable=False)
+    carrier_id       = Column(String, ForeignKey("carriers.carrier_id"), nullable=False)
     origin_city      = Column(String, nullable=False)
     destination_city = Column(String, nullable=False)
-    trucks_per_day   = Column(Integer, nullable=False)
     trip_date        = Column(String, nullable=False)
 ```
 
-**Column breakdown:**
+**Critical design change from the old schema:**
+- **No more `trucks_per_day` column.** Instead, `trucks_per_day` is computed as `COUNT(trip_id)` grouped by carrier. Each row represents ONE truck's ONE trip. 10 Knight-Swift trucks on NY→DC = 10 trip rows.
+- **No more `carrier_name` column.** The carrier name comes from a JOIN with the `carriers` table via `carrier_id`.
+- This is **proper normalization** - no derived/aggregated data stored in the table.
 
-| Column | Type | Purpose |
-|--------|------|---------|
-| `trip_id` | String (PK) | Unique identifier for each trip record (e.g., `"t001"`) |
-| `truck_id` | String | The truck performing this trip (e.g., `"TRK-1001"`) |
-| `carrier_name` | String | The logistics company name (e.g., `"Knight-Swift Transport Services"`) |
-| `origin_city` | String | Starting city (e.g., `"New York"`) |
-| `destination_city` | String | Ending city (e.g., `"Washington DC"`) |
-| `trucks_per_day` | Integer | How many trucks this carrier runs on this route daily |
-| `trip_date` | String | Date of the trip record (stored as string, e.g., `"2026-03-15"`) |
-
-**How this maps to a real SQL table:**
+**SQL equivalent:**
 
 ```sql
 CREATE TABLE trips (
     trip_id          TEXT PRIMARY KEY,
-    truck_id         TEXT NOT NULL,
-    carrier_name     TEXT NOT NULL,
+    truck_id         TEXT NOT NULL REFERENCES trucks(truck_id),
+    carrier_id       TEXT NOT NULL REFERENCES carriers(carrier_id),
     origin_city      TEXT NOT NULL,
     destination_city TEXT NOT NULL,
-    trucks_per_day   INTEGER NOT NULL,
     trip_date        TEXT NOT NULL
 );
 ```
 
 ### 3.3 Database Seeding (`apps/api/db/seed.py`)
 
-The seed module populates the database with initial data on startup.
+The seed module populates all 7 tables with realistic pipeline data on startup.
 
-**Seed data (6 trips across 2 routes):**
+**Seed data summary:**
 
-| Route | Carrier | Trucks/Day |
+| Table | Records | Description |
+|-------|---------|-------------|
+| cameras | 8 | Cameras on I-95, I-5, US-101, I-395, I-405 |
+| carriers | 8 | 6 route carriers + UPS + FedEx |
+| trucks | 59 | One truck per trip (matching the required trucks/day counts) |
+| image_transactions | 118 | 2 per truck (origin camera + destination camera) |
+| image_processing_results | 236 | 2 per image (plate detection + logo detection) |
+| truck_sightings | 118 | 1 per image (truck spotted at camera location) |
+| trips | 59 | One trip per truck per day |
+
+**Route data (trucks_per_day = number of trip records per carrier):**
+
+| Route | Carrier | Trip Records (= Trucks/Day) |
 |-------|---------|-----------|
 | New York → Washington DC | Knight-Swift Transport Services | 10 |
 | New York → Washington DC | J.B. Hunt Transport Services Inc | 7 |
@@ -170,35 +303,28 @@ The seed module populates the database with initial data on startup.
 | San Francisco → Los Angeles | XPO Logistics | 9 |
 | San Francisco → Los Angeles | Schneider | 6 |
 | San Francisco → Los Angeles | Landstar Systems | 2 |
+| Chicago → Detroit | UPS Inc. | 11 |
+| Chicago → Detroit | FedEx Corp | 9 |
 
-**Fallback carriers** (returned when a route has no data):
+**Fallback carriers** (returned when a searched route has no data):
 
 | Carrier | Trucks/Day |
 |---------|-----------|
 | UPS Inc. | 11 |
 | FedEx Corp | 9 |
 
-**The `seed_database()` function:**
+**How the pipeline data is generated:**
 
-```python
-def seed_database() -> None:
-    Base.metadata.create_all(bind=engine)  # 1. Create tables if they don't exist
+For each truck on a route, the seed creates a complete pipeline trace:
+1. **Origin image** - camera captures the truck departing
+2. **Processing results** - plate and logo detected from origin image
+3. **Origin sighting** - truck location recorded at origin camera
+4. **Destination image** - camera captures the truck arriving
+5. **Processing results** - plate and logo detected from destination image
+6. **Destination sighting** - truck location recorded at destination camera
+7. **Trip record** - precomputed trip from origin city to destination city
 
-    db = SessionLocal()
-    try:
-        existing_count = db.query(Trip).count()  # 2. Check if data exists
-        if existing_count > 0:
-            return  # 3. Skip if already seeded (idempotent)
-
-        for row in SEED_DATA:
-            trip = Trip(...)
-            db.add(trip)  # 4. Add each trip to the session
-        db.commit()       # 5. Write all to database at once
-    finally:
-        db.close()
-```
-
-**Key concept - Idempotency:** The function checks `existing_count > 0` before inserting. This means you can call `seed_database()` multiple times safely - it only inserts data on the very first run. This is important because it runs on every server startup.
+**Idempotency:** The function checks `db.query(Camera).count() > 0` before inserting, so it only seeds on the very first startup.
 
 ---
 
@@ -206,53 +332,57 @@ def seed_database() -> None:
 
 ### Repository Pattern (`apps/api/data/trips.py`)
 
-This module implements the **Repository Pattern** - it abstracts database queries behind simple function calls. The rest of the application never writes SQL directly; it calls these functions instead.
+This module implements the **Repository Pattern** - it abstracts database queries behind simple function calls. The rest of the application never writes raw SQL; it calls these functions instead.
 
-**The Trip dataclass:**
+**Dataclasses:**
 
 ```python
 @dataclass(frozen=True)
-class Trip:
+class TripRecord:
     trip_id: str
     truck_id: str
-    carrier_name: str
+    carrier_id: str
+    carrier_name: str       # Resolved via JOIN with carriers table
     origin_city: str
     destination_city: str
-    trucks_per_day: int
     trip_date: str
+
+@dataclass(frozen=True)
+class CarrierVolume:
+    carrier_name: str
+    trucks_per_day: int     # Computed as COUNT(trip_id) per carrier
 ```
 
-`frozen=True` makes instances **immutable** - once created, you cannot change any field. This prevents accidental mutations and makes the code safer.
+`frozen=True` makes instances **immutable** - once created, you cannot change any field. This prevents accidental mutations.
 
-**Why two Trip classes?** The codebase has both `db.models.Trip` (SQLAlchemy ORM model) and `data.trips.Trip` (frozen dataclass). The ORM model is tied to the database; the dataclass is a clean, immutable representation for business logic. The `_model_to_dataclass()` function converts between them.
-
-**Repository functions:**
+**Key repository functions:**
 
 ```python
-def get_all_trips() -> list[Trip]:
-    """Returns every trip in the database."""
-    # SELECT * FROM trips
-    rows = db.query(TripModel).all()
-    return [_model_to_dataclass(r) for r in rows]
+def get_all_trips() -> list[TripRecord]:
+    """Returns every trip with carrier name resolved via JOIN."""
+    # SELECT t.*, c.name FROM trips t JOIN carriers c ON t.carrier_id = c.carrier_id
+    rows = db.query(TripModel, Carrier.name) \
+             .join(Carrier, TripModel.carrier_id == Carrier.carrier_id).all()
+
+def get_carrier_volumes(origin: str, destination: str) -> list[CarrierVolume]:
+    """Count trips per carrier on a route (= trucks per day)."""
+    # SELECT c.name, COUNT(t.trip_id) as trucks_per_day
+    # FROM trips t JOIN carriers c ON t.carrier_id = c.carrier_id
+    # WHERE LOWER(t.origin_city) = ? AND LOWER(t.destination_city) = ?
+    # GROUP BY c.name ORDER BY COUNT(t.trip_id) DESC
 
 def get_unique_cities() -> list[str]:
-    """Returns sorted list of all cities (origins + destinations, deduplicated)."""
-    # SELECT DISTINCT origin_city FROM trips
-    # UNION
-    # SELECT DISTINCT destination_city FROM trips
-    origins = db.query(TripModel.origin_city).distinct().all()
-    destinations = db.query(TripModel.destination_city).distinct().all()
-    cities = {row[0] for row in origins} | {row[0] for row in destinations}
-    return sorted(cities)  # ["Los Angeles", "New York", "San Francisco", "Washington DC"]
+    """Returns sorted, deduplicated list of all origin + destination cities."""
 
 def get_unique_routes() -> list[dict[str, str]]:
     """Returns sorted list of all origin→destination pairs."""
-    # SELECT DISTINCT origin_city, destination_city FROM trips
-    routes = db.query(TripModel.origin_city, TripModel.destination_city).distinct().all()
-    return [{"origin": o, "destination": d} for o, d in sorted(routes)]
 ```
 
-**Pattern: Session Management**
+**The JOIN pattern:** Since the normalized schema stores `carrier_id` (not `carrier_name`) in the trips table, every query that needs carrier names must JOIN with the carriers table. This is the standard trade-off of normalization: queries are slightly more complex, but data integrity is guaranteed and updates only happen in one place.
+
+**The COUNT pattern:** `trucks_per_day` is no longer a stored column. It's computed as `COUNT(trip_id)` grouped by carrier. 10 Knight-Swift trip rows = 10 trucks/day.
+
+**Session Management:**
 
 Each function creates its own session and closes it in a `finally` block:
 
@@ -264,7 +394,7 @@ finally:
     db.close()  # Always close, even if an error occurs
 ```
 
-This prevents connection leaks. If the session isn't closed, the SQLite connection stays open, and over time you'll run out of available connections.
+This prevents connection leaks.
 
 ---
 
@@ -291,16 +421,27 @@ def search_carriers(origin: str, destination: str, db: Session | None = None) ->
 
 **Step-by-step logic:**
 
-1. **Query the database** with case-insensitive matching:
+1. **Query with JOIN + GROUP BY** to compute trucks_per_day from trip counts:
    ```python
-   rows = db.query(TripModel).filter(
-       func.lower(TripModel.origin_city) == origin.strip().lower(),
-       func.lower(TripModel.destination_city) == destination.strip().lower(),
-   ).order_by(TripModel.trucks_per_day.desc()).all()
+   rows = (
+       db.query(
+           Carrier.name,
+           func.count(TripModel.trip_id).label("trucks_per_day"),
+       )
+       .join(Carrier, TripModel.carrier_id == Carrier.carrier_id)
+       .filter(
+           func.lower(TripModel.origin_city) == origin.strip().lower(),
+           func.lower(TripModel.destination_city) == destination.strip().lower(),
+       )
+       .group_by(Carrier.name)
+       .order_by(func.count(TripModel.trip_id).desc())
+       .all()
+   )
    ```
-   - `func.lower()` converts the DB value to lowercase for comparison
-   - `.strip().lower()` normalizes the user input
-   - Results are sorted by `trucks_per_day` descending (busiest carrier first)
+   - JOINs `trips` with `carriers` to get carrier names
+   - `COUNT(trip_id)` per carrier = number of trucks on that route per day
+   - `func.lower()` for case-insensitive city matching
+   - Results sorted by truck count descending (busiest carrier first)
 
 2. **If matches found**, return them as `CarrierResult` objects
 
@@ -355,19 +496,18 @@ Each classification changes how the SQL is built and how results are formatted.
 
 #### Stage 3: SQL Generation
 
-The service dynamically builds a SQL string based on extracted entities and query type:
+The service dynamically builds a display SQL string reflecting the normalized JOIN-based schema:
 
-```python
-# Base structure
-SELECT carrier_name, trucks_per_day
-FROM trips
-WHERE origin_city = '...' AND destination_city = '...'
+```sql
+-- Base structure (carriers query)
+SELECT c.name AS carrier_name, COUNT(t.trip_id) AS trucks_per_day
+FROM trips t
+JOIN carriers c ON t.carrier_id = c.carrier_id
+WHERE t.origin_city = 'New York' AND t.destination_city = 'Washington DC'
+GROUP BY c.name
 ORDER BY trucks_per_day DESC
 
-# If query_type == "count":
-SELECT COUNT(*) as total_carriers, SUM(trucks_per_day) as total_trucks
-
-# If query_type == "top":
+-- If query_type == "top":
 ... ORDER BY trucks_per_day DESC LIMIT 5
 ```
 
@@ -375,7 +515,7 @@ SELECT COUNT(*) as total_carriers, SUM(trucks_per_day) as total_trucks
 
 #### Stage 4: Execution & Explanation
 
-**`_execute_on_dataset()`** runs the actual query via SQLAlchemy ORM with the same filters. If no results are found and both origin+destination were provided, it returns fallback carriers.
+**`_execute_on_dataset()`** runs the actual query via SQLAlchemy ORM with a JOIN between `trips` and `carriers`, GROUP BY carrier name, and COUNT of trip records. If no results are found and both origin+destination were provided, it returns fallback carriers.
 
 **`_generate_explanation()`** produces a human-readable sentence:
 - Count query: `"There are 3 carriers operating between New York and Washington DC with a combined 22 trucks per day."`
@@ -487,10 +627,11 @@ POST /ai-query
 ```json
 {
   "query": "Which carriers operate between New York and Washington DC?",
-  "sql": "SELECT carrier_name, trucks_per_day\nFROM trips\nWHERE origin_city = 'New York' AND destination_city = 'Washington DC'\nORDER BY trucks_per_day DESC",
+  "sql": "SELECT c.name AS carrier_name, COUNT(t.trip_id) AS trucks_per_day\nFROM trips t\nJOIN carriers c ON t.carrier_id = c.carrier_id\nWHERE t.origin_city = 'New York' AND t.destination_city = 'Washington DC'\nGROUP BY c.name\nORDER BY trucks_per_day DESC",
   "results": [
     { "carrier_name": "Knight-Swift Transport Services", "trucks_per_day": 10, "origin": "New York", "destination": "Washington DC" },
-    { "carrier_name": "J.B. Hunt Transport Services Inc", "trucks_per_day": 7, "origin": "New York", "destination": "Washington DC" }
+    { "carrier_name": "J.B. Hunt Transport Services Inc", "trucks_per_day": 7, "origin": "New York", "destination": "Washington DC" },
+    { "carrier_name": "YRC Worldwide", "trucks_per_day": 5, "origin": "New York", "destination": "Washington DC" }
   ],
   "explanation": "The top carriers between New York and Washington DC are: Knight-Swift Transport Services (10 trucks/day), J.B. Hunt Transport Services Inc (7 trucks/day), YRC Worldwide (5 trucks/day)"
 }
@@ -532,16 +673,21 @@ FastAPI's `lifespan` replaces the older `@app.on_event("startup")` pattern. It e
 **CORS middleware:**
 
 ```python
+ALLOWED_ORIGINS = os.getenv(
+    "ALLOWED_ORIGINS",
+    "http://localhost:3000,http://localhost:3001,https://genlogs-platform-web.vercel.app",
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 ```
 
-**Why CORS is needed:** The frontend runs on `localhost:3000` and the API on `localhost:8000`. Browsers block cross-origin requests by default (Same-Origin Policy). This middleware tells the browser: "requests from ports 3000 and 3001 are allowed."
+**Why CORS is needed:** The frontend runs on `localhost:3000` and the API on `localhost:8000`. Browsers block cross-origin requests by default (Same-Origin Policy). This middleware tells the browser which origins are allowed. The origins are configurable via the `ALLOWED_ORIGINS` environment variable for deployment flexibility.
 
 **Router registration:**
 
@@ -947,8 +1093,8 @@ User clicks "Search"
 Backend receives request
   └→ Pydantic validates the JSON
        └→ search_carriers("New York", "Washington DC")
-            └→ SQLAlchemy query: WHERE LOWER(origin_city) = 'new york' AND LOWER(destination_city) = 'washington dc'
-                 └→ Returns 3 rows, sorted by trucks_per_day DESC
+            └→ SQLAlchemy: JOIN trips + carriers, GROUP BY carrier name, COUNT trips
+                 └→ Knight-Swift: 10 trips, J.B. Hunt: 7 trips, YRC: 5 trips
                       └→ Response: { carriers: [...], total_carriers: 3 }
 
 Frontend receives response
@@ -971,12 +1117,12 @@ Backend receives request
   └→ _extract_carrier(...) → None (no carrier name found)
   └→ _classify_query(...) → "carriers" (matches "carriers" keyword)
   └→ Build SQL:
-       SELECT carrier_name, trucks_per_day
-       FROM trips
-       WHERE origin_city = 'New York' AND destination_city = 'Washington DC'
-       ORDER BY trucks_per_day DESC
+       SELECT c.name AS carrier_name, COUNT(t.trip_id) AS trucks_per_day
+       FROM trips t JOIN carriers c ON t.carrier_id = c.carrier_id
+       WHERE t.origin_city = 'New York' AND t.destination_city = 'Washington DC'
+       GROUP BY c.name ORDER BY trucks_per_day DESC
   └→ _execute_on_dataset(origin="new york", destination="washington dc")
-       └→ SQLAlchemy query → 3 results
+       └→ SQLAlchemy JOIN + GROUP BY → 3 carrier results
   └→ _generate_explanation("carriers", "new york", "washington dc", None, results)
        └→ "The top carriers between New York and Washington DC are: Knight-Swift (10 trucks/day), ..."
   └→ Response: { sql: "...", results: [...], explanation: "..." }
